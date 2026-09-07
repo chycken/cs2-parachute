@@ -1,4 +1,4 @@
-﻿using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
 using SwiftlyS2.Shared;
 using SwiftlyS2.Shared.Convars;
@@ -239,12 +239,14 @@ public sealed class Parachute(ISwiftlyCore core) : BasePlugin(core)
 
     private CDynamicProp? CreateParachute(CCSPlayerPawn playerPawn)
     {
+        if (string.IsNullOrEmpty(Config.Settings.Model)) return null;
+
         var entity = Core.EntitySystem.CreateEntityByDesignerName<CDynamicProp>("prop_dynamic_override");
         if (entity?.IsValid is not true) return null;
 
-        entity.Teleport(playerPawn.AbsOrigin, QAngle.Zero, Vector.Zero);
-        entity.DispatchSpawn();
         entity.SetModel(Config.Settings.Model);
+        entity.DispatchSpawn();
+        entity.Teleport(playerPawn.AbsOrigin, QAngle.Zero, Vector.Zero);
 
         return entity;
     }
