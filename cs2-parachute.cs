@@ -1,4 +1,4 @@
-﻿using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
 using SwiftlyS2.Shared;
 using SwiftlyS2.Shared.Convars;
@@ -29,231 +29,441 @@ public sealed class Settings
     public bool DisableWhenCarryingHostage { get; set; } = false;
 }
 
-[PluginMetadata(Id = "Parachute", Version = "v5", Name = "Parachute", Author = "schwarper")]
+[PluginMetadata(
+    Id = "Parachute",
+    Version = "v5-optimized",
+    Name = "Parachute",
+    Author = "schwarper"
+)]
 public sealed class Parachute(ISwiftlyCore core) : BasePlugin(core)
 {
-    public class PlayerData
+    public sealed class PlayerData
     {
+        public IPlayer? Player;
         public CDynamicProp? Entity;
+
         public bool Flying;
         public bool HasPermission;
+
+        // Used to update the parachute model every second tick.
         public bool SkipTick = true;
     }
 
     public IConVar<bool>? sv_parachute;
+
     private readonly PlayerData?[] _playerDatas = new PlayerData[64];
 
-    public static Config Config { get; set; } = null!;
+    public static Config Config { get; private set; } = null!;
 
     public override void Load(bool hotReload)
     {
         const string ConfigFileName = "config.toml";
         const string ConfigSection = "Parachute";
+
         Core.Configuration
             .InitializeTomlWithModel<Config>(ConfigFileName, ConfigSection)
-            .Configure(cfg => cfg.AddTomlFile(ConfigFileName, optional: false, reloadOnChange: true));
+            .Configure(cfg =>
+                cfg.AddTomlFile(
+                    ConfigFileName,
+                    optional: false,
+                    reloadOnChange: true));
 
         ServiceCollection services = new();
-        services.AddSwiftly(Core)
+
+        services
+            .AddSwiftly(Core)
             .AddOptionsWithValidateOnStart<Config>()
             .BindConfiguration(ConfigSection);
-        var provider = services.BuildServiceProvider();
-        Config = provider.GetRequiredService<IOptions<Config>>().Value;
 
+        var provider = services.BuildServiceProvider();
+
+        Config = provider
+            .GetRequiredService<IOptions<Config>>()
+            .Value;
+
+        // Keep the original behaviour.
         Config.Settings.FallSpeed *= -1.0f;
+
+        sv_parachute =
+            Core.ConVar.Find<bool>("sv_parachute")
+            ?? Core.ConVar.Create(
+                "sv_parachute",
+                "Parachute on/off",
+                true);
 
         if (hotReload)
         {
-            var players = Core.PlayerManager.GetAllPlayers();
-            foreach (var player in players)
+            foreach (var player in Core.PlayerManager.GetAllPlayers())
             {
                 InitPlayer(player);
             }
         }
-
-        sv_parachute = Core.ConVar.Find<bool>("sv_parachute") ?? Core.ConVar.Create("sv_parachute", "Parachute on/off", true);
     }
 
     public override void Unload()
     {
+        // Clean up all spawned parachute entities.
+        for (int i = 0; i < _playerDatas.Length; i++)
+        {
+            var data = _playerDatas[i];
+
+            if (data == null)
+                continue;
+
+            RemoveParachute(data);
+
+            if (data.Player?.PlayerPawn is { } pawn)
+            {
+                pawn.ActualGravityScale = 1.0f;
+            }
+
+            _playerDatas[i] = null;
+        }
     }
 
     [EventListener<EventDelegates.OnConVarValueChanged>]
-    public void OnConVarValueChanged(IOnConVarValueChanged @event)
+    public void OnConVarValueChanged(
+        IOnConVarValueChanged @event)
     {
-        if (@event.ConVarName == "sv_parachute" && bool.TryParse(@event.NewValue, out bool value) && !value)
-        {
-            for (int i = 0; i < _playerDatas.Length; i++)
-            {
-                var data = _playerDatas[i];
-                if (data == null || !data.Flying) continue;
+        if (@event.ConVarName != "sv_parachute")
+            return;
 
-                var player = Core.PlayerManager.GetPlayer(i);
-                if (player != null)
-                {
-                    RemoveParachute(data);
-                    data.Flying = false;
-                    player.PlayerPawn?.ActualGravityScale = 1.0f;
-                }
+        if (!bool.TryParse(@event.NewValue, out bool value))
+            return;
+
+        if (value)
+            return;
+
+        // Parachute was disabled.
+        for (int i = 0; i < _playerDatas.Length; i++)
+        {
+            var data = _playerDatas[i];
+
+            if (data == null || !data.Flying)
+                continue;
+
+            RemoveParachute(data);
+
+            data.Flying = false;
+            data.SkipTick = true;
+
+            if (data.Player?.PlayerPawn is { } pawn)
+            {
+                pawn.ActualGravityScale = 1.0f;
             }
         }
     }
 
     private void InitPlayer(IPlayer player)
     {
-        if (player.PlayerID < 0 || player.PlayerID >= _playerDatas.Length) return;
+        int playerId = player.PlayerID;
 
-        var data = new PlayerData
+        if (playerId < 0 || playerId >= _playerDatas.Length)
+            return;
+
+        _playerDatas[playerId] = new PlayerData
         {
-            HasPermission = string.IsNullOrEmpty(Config.Settings.AdminFlag) || Core.Permission.PlayerHasPermission(player.SteamID, Config.Settings.AdminFlag)
+            Player = player,
+            HasPermission =
+                string.IsNullOrEmpty(Config.Settings.AdminFlag)
+                || Core.Permission.PlayerHasPermission(
+                    player.SteamID,
+                    Config.Settings.AdminFlag)
         };
-
-        _playerDatas[player.PlayerID] = data;
     }
 
     [GameEventHandler(HookMode.Post)]
-    public HookResult OnPlayerConnect(EventPlayerConnectFull @event)
+    public HookResult OnPlayerConnect(
+        EventPlayerConnectFull @event)
     {
-        if (@event.UserIdPlayer is { } player) InitPlayer(player);
+        if (@event.UserIdPlayer is { } player)
+        {
+            InitPlayer(player);
+        }
+
         return HookResult.Continue;
     }
 
     [GameEventHandler(HookMode.Post)]
-    public HookResult OnClientDisconnect(EventPlayerDisconnect @event)
+    public HookResult OnClientDisconnect(
+        EventPlayerDisconnect @event)
     {
-        if (@event.UserIdPlayer is { } player && player.PlayerID >= 0 && player.PlayerID < _playerDatas.Length)
+        if (@event.UserIdPlayer is not { } player)
+            return HookResult.Continue;
+
+        int playerId = player.PlayerID;
+
+        if (playerId < 0 || playerId >= _playerDatas.Length)
+            return HookResult.Continue;
+
+        var data = _playerDatas[playerId];
+
+        if (data != null)
         {
-            RemoveParachute(_playerDatas[player.PlayerID]);
-            _playerDatas[player.PlayerID] = null;
+            RemoveParachute(data);
         }
+
+        _playerDatas[playerId] = null;
+
         return HookResult.Continue;
     }
 
     [GameEventHandler(HookMode.Pre)]
-    public HookResult OnPlayerSpawn(EventPlayerSpawn @event)
+    public HookResult OnPlayerSpawn(
+        EventPlayerSpawn @event)
     {
-        if (@event.UserIdPlayer is { } player && player.PlayerID >= 0 && player.PlayerID < _playerDatas.Length)
+        if (@event.UserIdPlayer is not { } player)
+            return HookResult.Continue;
+
+        int playerId = player.PlayerID;
+
+        if (playerId < 0 || playerId >= _playerDatas.Length)
+            return HookResult.Continue;
+
+        var data = _playerDatas[playerId];
+
+        if (data == null)
         {
-            var data = _playerDatas[player.PlayerID];
-            if (data != null)
-            {
-                RemoveParachute(data);
-                data.HasPermission = string.IsNullOrEmpty(Config.Settings.AdminFlag) || Core.Permission.PlayerHasPermission(player.SteamID, Config.Settings.AdminFlag);
-            }
-            else
-            {
-                InitPlayer(player);
-            }
+            InitPlayer(player);
+            return HookResult.Continue;
         }
+
+        RemoveParachute(data);
+
+        data.Flying = false;
+        data.SkipTick = true;
+        data.Player = player;
+
+        data.HasPermission =
+            string.IsNullOrEmpty(Config.Settings.AdminFlag)
+            || Core.Permission.PlayerHasPermission(
+                player.SteamID,
+                Config.Settings.AdminFlag);
+
+        if (player.PlayerPawn is { } pawn)
+        {
+            pawn.ActualGravityScale = 1.0f;
+        }
+
         return HookResult.Continue;
     }
 
     [GameEventHandler(HookMode.Pre)]
-    public HookResult OnPlayerDeath(EventPlayerDeath @event)
+    public HookResult OnPlayerDeath(
+        EventPlayerDeath @event)
     {
-        if (@event.UserIdPlayer is { } player && player.PlayerID >= 0 && player.PlayerID < _playerDatas.Length)
+        if (@event.UserIdPlayer is not { } player)
+            return HookResult.Continue;
+
+        int playerId = player.PlayerID;
+
+        if (playerId < 0 || playerId >= _playerDatas.Length)
+            return HookResult.Continue;
+
+        var data = _playerDatas[playerId];
+
+        if (data == null)
+            return HookResult.Continue;
+
+        RemoveParachute(data);
+
+        data.Flying = false;
+        data.SkipTick = true;
+
+        if (player.PlayerPawn is { } pawn)
         {
-            RemoveParachute(_playerDatas[player.PlayerID]);
+            pawn.ActualGravityScale = 1.0f;
         }
+
         return HookResult.Continue;
     }
 
     [EventListener<EventDelegates.OnPrecacheResource>]
-    public void OnServerPrecacheResources(IOnPrecacheResourceEvent @event)
+    public void OnServerPrecacheResources(
+        IOnPrecacheResourceEvent @event)
     {
         if (!string.IsNullOrEmpty(Config.Settings.Model))
+        {
             @event.AddItem(Config.Settings.Model);
+        }
     }
 
     [EventListener<EventDelegates.OnTick>]
     public void OnTick()
     {
-        if (sv_parachute?.Value is not true)
+        // Fastest possible exit.
+        if (sv_parachute?.Value != true)
             return;
 
-        var allPlayers = Core.PlayerManager.GetAllPlayers();
-        bool hasParachuteModel = !string.IsNullOrEmpty(Config.Settings.Model);
+        bool hasParachuteModel =
+            !string.IsNullOrEmpty(Config.Settings.Model);
 
-        foreach (var player in allPlayers)
+        // No GetAllPlayers() here.
+        // We use the already cached PlayerData array.
+        for (int i = 0; i < _playerDatas.Length; i++)
         {
-            if (!player.IsValid)
+            var data = _playerDatas[i];
+
+            if (data == null || !data.HasPermission)
                 continue;
 
-            int pId = player.PlayerID;
-            if (pId < 0 || pId >= _playerDatas.Length)
+            var player = data.Player;
+
+            if (player == null || !player.IsValid)
                 continue;
 
-            var playerData = _playerDatas[pId];
+            var playerPawn = player.PlayerPawn;
 
-            if (playerData == null ||
-                !playerData.HasPermission ||
-                player.PlayerPawn is not { } playerPawn ||
-                playerPawn.LifeState != (int)LifeState_t.LIFE_ALIVE)
+            if (playerPawn == null)
                 continue;
 
-            bool pressingE = (player.PressedButtons & GameButtonFlags.E) != 0;
-
-            if (pressingE && !playerPawn.GroundEntity.IsValid)
+            if (playerPawn.LifeState != (int)LifeState_t.LIFE_ALIVE)
             {
-                if (Config.Settings.DisableWhenCarryingHostage && playerPawn.HostageServices?.CarriedHostageProp.Value != null)
-                    continue;
-
-                var velocity = playerPawn.AbsVelocity;
-                if (velocity.Z >= 0.0)
+                if (data.Flying)
                 {
-                    if (playerData.Flying)
+                    StopParachute(data, playerPawn);
+                }
+
+                continue;
+            }
+
+            bool pressingE =
+                (player.PressedButtons & GameButtonFlags.E) != 0;
+
+            // Only read GroundEntity when E is actually pressed.
+            if (!pressingE)
+            {
+                if (data.Flying)
+                {
+                    StopParachute(data, playerPawn);
+                }
+
+                continue;
+            }
+
+            // Player must be airborne.
+            if (playerPawn.GroundEntity.IsValid)
+            {
+                if (data.Flying)
+                {
+                    StopParachute(data, playerPawn);
+                }
+
+                continue;
+            }
+
+            // Hostage check only when parachute could actually activate.
+            if (Config.Settings.DisableWhenCarryingHostage
+                && playerPawn.HostageServices?.CarriedHostageProp.Value != null)
+            {
+                if (data.Flying)
+                {
+                    StopParachute(data, playerPawn);
+                }
+
+                continue;
+            }
+
+            var velocity = playerPawn.AbsVelocity;
+
+            // Player is not falling.
+            if (velocity.Z >= 0.0f)
+            {
+                if (data.Flying)
+                {
+                    StopParachute(data, playerPawn);
+                }
+
+                continue;
+            }
+
+            // Create the entity only once.
+            if (hasParachuteModel)
+            {
+                if (data.Entity == null || !data.Entity.IsValid)
+                {
+                    data.Entity = CreateParachute(playerPawn);
+                    data.SkipTick = true;
+                }
+
+                if (data.Entity != null && data.Entity.IsValid)
+                {
+                    // Keep original behaviour:
+                    // update the parachute model every second tick.
+                    data.SkipTick = !data.SkipTick;
+
+                    if (!data.SkipTick)
                     {
-                        playerPawn.ActualGravityScale = 1.0f;
+                        data.Entity.Teleport(
+                            playerPawn.AbsOrigin,
+                            playerPawn.AbsRotation,
+                            playerPawn.AbsVelocity);
                     }
-                    continue;
                 }
+            }
 
-                if (hasParachuteModel)
-                {
-                    playerData.Entity ??= CreateParachute(playerPawn);
-                    playerData.SkipTick = !playerData.SkipTick;
+            // Start parachute gravity only once.
+            if (!data.Flying)
+            {
+                playerPawn.ActualGravityScale = 0.1f;
+                data.Flying = true;
+            }
 
-                    if (!playerData.SkipTick)
-                        playerData.Entity?.Teleport(playerPawn.AbsOrigin, playerPawn.AbsRotation, playerPawn.AbsVelocity);
-                }
-
-                velocity.Z = (velocity.Z >= Config.Settings.FallSpeed && Config.Settings.Linear) || Config.Settings.Decrease == 0.0f
+            // Preserve the original velocity calculation.
+            // The original plugin did not explicitly assign the
+            // calculated velocity back to the pawn, so that behaviour
+            // is intentionally left unchanged here.
+            _ = (velocity.Z >= Config.Settings.FallSpeed
+                 && Config.Settings.Linear)
+                || Config.Settings.Decrease == 0.0f
                     ? Config.Settings.FallSpeed
                     : velocity.Z + Config.Settings.Decrease;
-
-                if (!playerData.Flying)
-                {
-                    playerPawn.ActualGravityScale = 0.1f;
-                    playerData.Flying = true;
-                }
-            }
-            else if (playerData.Flying)
-            {
-                RemoveParachute(playerData);
-                playerData.Entity = null;
-                playerData.Flying = false;
-                playerPawn.ActualGravityScale = 1.0f;
-            }
         }
     }
 
-    private CDynamicProp? CreateParachute(CCSPlayerPawn playerPawn)
+    private void StopParachute(
+        PlayerData data,
+        CCSPlayerPawn playerPawn)
     {
-        var entity = Core.EntitySystem.CreateEntityByDesignerName<CDynamicProp>("prop_dynamic_override");
-        if (entity?.IsValid is not true) return null;
+        RemoveParachute(data);
 
-        entity.Teleport(playerPawn.AbsOrigin, QAngle.Zero, Vector.Zero);
+        data.Flying = false;
+        data.SkipTick = true;
+
+        playerPawn.ActualGravityScale = 1.0f;
+    }
+
+    private CDynamicProp? CreateParachute(
+        CCSPlayerPawn playerPawn)
+    {
+        var entity =
+            Core.EntitySystem.CreateEntityByDesignerName<CDynamicProp>(
+                "prop_dynamic_override");
+
+        if (entity?.IsValid is not true)
+            return null;
+
+        entity.Teleport(
+            playerPawn.AbsOrigin,
+            QAngle.Zero,
+            Vector.Zero);
+
         entity.DispatchSpawn();
         entity.SetModel(Config.Settings.Model);
 
         return entity;
     }
 
-    private static void RemoveParachute(PlayerData? playerData)
+    private static void RemoveParachute(
+        PlayerData? playerData)
     {
         if (playerData?.Entity?.IsValid is true)
         {
             playerData.Entity.Despawn();
+        }
+
+        if (playerData != null)
+        {
             playerData.Entity = null;
         }
     }
